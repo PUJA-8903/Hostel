@@ -59,8 +59,7 @@ def parse_database_url(database_url):
         'connect_timeout': int(os.environ.get('DB_CONNECT_TIMEOUT', '10')),
     }
     conn_kwargs.update(query_params)
-   if DATABASE_URL:
-    conn_kwargs.setdefault('sslmode', 'require')
+    if os.environ.get('RENDER') == '1':
         conn_kwargs.setdefault('sslmode', 'require')
     return conn_kwargs
 
@@ -72,12 +71,7 @@ def is_db_closed(conn):
 def get_db_connection():
     if 'db' not in g or is_db_closed(g.db):
         if DATABASE_URL:
-            try:
-    g.db = psycopg2.connect(**parse_database_url(DATABASE_URL))
-    bootstrap_database(g.db)
-except Exception as e:
-    print("Database connection error:", e)
-    raise
+            g.db = psycopg2.connect(**parse_database_url(DATABASE_URL))
         else:
             g.db = psycopg2.connect(
                 host=DB_HOST,
