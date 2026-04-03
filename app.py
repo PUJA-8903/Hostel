@@ -394,7 +394,7 @@ def login():
         cursor.execute('SELECT * FROM Users WHERE email = %s', (email,))
         user = cursor.fetchone()
         cursor.close()
-    except psycopg2.OperationalError as e:
+    except psycopg2.Error as e:
         flash(f'Database connection error: {str(e)}', 'error')
         return redirect(url_for('login'))
 
@@ -443,29 +443,34 @@ def register():
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        try:
+            # Check if email exists
+            cursor.execute('SELECT * FROM Users WHERE email = %s', (email,))
+            existing_user = cursor.fetchone()
 
-        # Check if email exists
-        cursor.execute('SELECT * FROM Users WHERE email = %s', (email,))
-        existing_user = cursor.fetchone()
+            if existing_user:
+                flash('Email already exists!', 'error')
+                return redirect(url_for('register'))
 
-        if existing_user:
-            cursor.close()
-            flash('Email already exists!', 'error')
+            # Hash password
+            hashed_password = generate_password_hash(password)
+
+            # Insert user
+            cursor.execute(
+                'INSERT INTO Users (full_name, email, password, role) VALUES (%s, %s, %s, %s)',
+                (full_name, email, hashed_password, role)
+            )
+            conn.commit()
+
+            flash(
+                f'Successfully registered as {role}. Please login.', 'success')
+            return redirect(url_for('login'))
+        except psycopg2.Error as e:
+            conn.rollback()
+            flash(f'Registration failed due to a database error: {e}', 'error')
             return redirect(url_for('register'))
-
-        # Hash password
-        hashed_password = generate_password_hash(password)
-
-        # Insert user
-        cursor.execute(
-            'INSERT INTO Users (full_name, email, password, role) VALUES (%s, %s, %s, %s)',
-            (full_name, email, hashed_password, role)
-        )
-        conn.commit()
-        cursor.close()
-
-        flash(f'Successfully registered as {role}. Please login.', 'success')
-        return redirect(url_for('login'))
+        finally:
+            cursor.close()
 
     return render_template('register.html')
 
