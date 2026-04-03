@@ -83,7 +83,7 @@ def get_db_connection():
                 connect_timeout=int(os.environ.get(
                     'DB_CONNECT_TIMEOUT', '10')),
             )
-            bootstrap_database(g.db)
+        bootstrap_database(g.db)
     return g.db
 
 
