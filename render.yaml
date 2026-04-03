@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: py-hostel
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class eventlet --workers 1 --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: py-hostel-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_SECRET
+        sync: false
+      - key: RENDER
+        value: "1"
+
+databases:
+  - name: py-hostel-db
+    databaseName: nasa_home
+    user: py_hostel_user

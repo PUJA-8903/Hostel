@@ -1,12 +1,19 @@
 import os
+from io import BytesIO
+from urllib.parse import urlparse, parse_qsl, unquote
 from dotenv import load_dotenv
 from flask import Flask, render_template, request, redirect, url_for, session, flash, make_response, jsonify, g
 from flask_socketio import SocketIO, emit, join_room
-import pymysql
-import pdfkit
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 load_dotenv()
 
@@ -26,32 +33,112 @@ VALID_NOTICE_TARGET_ROLES = ['All', 'Admin', 'Student', 'Teacher']
 VALID_FOOD_CATEGORIES = ['Non-Veg', 'Veg']
 
 # Database connection details
+DATABASE_URL = os.environ.get('DATABASE_URL')
 DB_HOST = os.environ.get('DB_HOST', 'localhost')
-DB_USER = os.environ.get('DB_USER', 'root')
+DB_USER = os.environ.get('DB_USER', 'postgres')
 DB_PASSWORD = os.environ.get('DB_PASSWORD', '')
 DB_NAME = os.environ.get('DB_NAME', 'nasa_home')
+DB_PORT = int(os.environ.get('DB_PORT', '5432'))
+SCHEMA_BOOTSTRAP_DONE = False
+
+
+def parse_database_url(database_url):
+    parsed = urlparse(database_url)
+    if parsed.scheme not in ('postgres', 'postgresql'):
+        raise RuntimeError(
+            'Only postgres:// or postgresql:// DATABASE_URL is supported.')
+
+    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    conn_kwargs = {
+        'dbname': unquote(parsed.path.lstrip('/')),
+        'user': unquote(parsed.username or ''),
+        'password': unquote(parsed.password or ''),
+        'host': parsed.hostname,
+        'port': parsed.port or 5432,
+        'cursor_factory': RealDictCursor,
+        'connect_timeout': int(os.environ.get('DB_CONNECT_TIMEOUT', '10')),
+    }
+    conn_kwargs.update(query_params)
+    if os.environ.get('RENDER') == '1':
+        conn_kwargs.setdefault('sslmode', 'require')
+    return conn_kwargs
+
+
+def is_db_closed(conn):
+    return not conn or getattr(conn, 'closed', 1) != 0
 
 
 def get_db_connection():
-    if 'db' not in g:
-        g.db = pymysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            cursorclass=pymysql.cursors.DictCursor
-        )
+    if 'db' not in g or is_db_closed(g.db):
+        if DATABASE_URL:
+            g.db = psycopg2.connect(**parse_database_url(DATABASE_URL))
+        else:
+            g.db = psycopg2.connect(
+                host=DB_HOST,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                dbname=DB_NAME,
+                port=DB_PORT,
+                cursor_factory=RealDictCursor,
+                connect_timeout=int(os.environ.get(
+                    'DB_CONNECT_TIMEOUT', '10')),
+            )
+            bootstrap_database(g.db)
     return g.db
 
 
 @app.teardown_appcontext
 def close_db(error):
     db = g.pop('db', None)
-    if db is not None and db.open:
+    if db is not None and not is_db_closed(db):
         try:
             db.close()
         except:
             pass
+
+
+def insert_and_get_id(cursor, query, params):
+    cursor.execute(f'{query} RETURNING id', params)
+    row = cursor.fetchone()
+    return row['id'] if row else None
+
+
+def format_currency(value):
+    try:
+        return f'Tk {float(value):.2f}'
+    except (TypeError, ValueError):
+        return 'Tk 0.00'
+
+
+def format_timestamp(value):
+    if isinstance(value, datetime):
+        return value.strftime('%Y-%m-%d %H:%M')
+    return str(value or '-')
+
+
+def bootstrap_database(conn):
+    global SCHEMA_BOOTSTRAP_DONE
+
+    if SCHEMA_BOOTSTRAP_DONE or os.environ.get('DISABLE_DB_BOOTSTRAP') == '1':
+        return
+
+    schema_path = os.path.join(
+        os.path.dirname(__file__), 'schema_postgres.sql')
+    if not os.path.exists(schema_path):
+        SCHEMA_BOOTSTRAP_DONE = True
+        return
+
+    cursor = conn.cursor()
+    try:
+        with open(schema_path, 'r', encoding='utf-8') as schema_file:
+            cursor.execute(schema_file.read())
+        conn.commit()
+        SCHEMA_BOOTSTRAP_DONE = True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
 
 
 def get_dashboard_endpoint():
@@ -105,13 +192,13 @@ def ensure_notices_table():
     cursor = conn.cursor()
     try:
         cursor.execute('''CREATE TABLE IF NOT EXISTS Notices (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                             title VARCHAR(255) NOT NULL,
                             message TEXT NOT NULL,
-                            target_role ENUM('All', 'Admin', 'Student', 'Teacher') DEFAULT 'All',
+                    target_role VARCHAR(20) DEFAULT 'All' CHECK (target_role IN ('All', 'Admin', 'Student', 'Teacher')),
                             is_active BOOLEAN DEFAULT TRUE,
                             is_pinned BOOLEAN DEFAULT FALSE,
-                            expires_at DATETIME NULL,
+                    expires_at TIMESTAMP NULL,
                             created_by INT NULL,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             FOREIGN KEY (created_by) REFERENCES Users(id) ON DELETE SET NULL
@@ -128,13 +215,12 @@ def create_notification(user_id, message):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute(
+        notification_id = insert_and_get_id(
+            cursor,
             'INSERT INTO Notifications (user_id, message) VALUES (%s, %s)',
             (user_id, message)
         )
         conn.commit()
-
-        notification_id = cursor.lastrowid
         cursor.execute(
             'SELECT id, user_id, message, is_read, created_at FROM Notifications WHERE id = %s',
             (notification_id,)
@@ -208,7 +294,7 @@ def api_notifications():
     notifications = cursor.fetchall()
 
     cursor.execute(
-        'SELECT COUNT(*) AS unread_count FROM Notifications WHERE user_id = %s AND is_read = 0',
+        'SELECT COUNT(*) AS unread_count FROM Notifications WHERE user_id = %s AND is_read = FALSE',
         (session['user_id'],)
     )
     unread_count = cursor.fetchone()['unread_count']
@@ -236,7 +322,7 @@ def api_mark_notification_read(notification_id):
     conn.commit()
 
     cursor.execute(
-        'SELECT COUNT(*) AS unread_count FROM Notifications WHERE user_id = %s AND is_read = 0',
+        'SELECT COUNT(*) AS unread_count FROM Notifications WHERE user_id = %s AND is_read = FALSE',
         (session['user_id'],)
     )
     unread_count = cursor.fetchone()['unread_count']
@@ -279,7 +365,7 @@ def api_notices():
                       FROM Notices
                       WHERE is_active = TRUE
                         AND (target_role = 'All' OR target_role = %s)
-                        AND (expires_at IS NULL OR expires_at >= NOW())
+                        AND (expires_at IS NULL OR expires_at >= CURRENT_TIMESTAMP)
                       ORDER BY is_pinned DESC, created_at DESC
                       LIMIT %s''', (session['role'], limit))
     notices = cursor.fetchall()
@@ -308,7 +394,7 @@ def login():
         cursor.execute('SELECT * FROM Users WHERE email = %s', (email,))
         user = cursor.fetchone()
         cursor.close()
-    except pymysql.err.OperationalError as e:
+    except psycopg2.OperationalError as e:
         flash(f'Database connection error: {str(e)}', 'error')
         return redirect(url_for('login'))
 
@@ -431,7 +517,7 @@ def admin_rooms():
                            (room_number, capacity, teacher_id))
             conn.commit()
             flash('Room added successfully!', 'success')
-        except pymysql.err.IntegrityError:
+        except psycopg2.IntegrityError:
             flash(
                 f'Room {room_number} already exists. Please use a different room number.', 'error')
         except Exception as e:
@@ -669,7 +755,7 @@ def admin_orders():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''SELECT o.id, u.full_name as student_name, o.total_amount, o.order_date, 
-                      GROUP_CONCAT(CONCAT(f.name, " (", od.quantity, ")") SEPARATOR ", ") as items
+                      STRING_AGG(CONCAT(f.name, ' (', od.quantity, ')'), ', ') as items
                       FROM Orders o
                       JOIN Users u ON o.student_id = u.id
                       JOIN Order_Details od ON o.id = od.order_id
@@ -1056,9 +1142,11 @@ def student_order_food():
                 return redirect(url_for('student_order_food'))
 
             # Create Order
-            cursor.execute('INSERT INTO Orders (student_id, total_amount) VALUES (%s, %s)',
-                           (student_id, total_amount))
-            order_id = cursor.lastrowid
+            order_id = insert_and_get_id(
+                cursor,
+                'INSERT INTO Orders (student_id, total_amount) VALUES (%s, %s)',
+                (student_id, total_amount)
+            )
 
             # Insert Details
             for detail in order_details:
@@ -1102,7 +1190,7 @@ def student_my_orders():
     cursor = conn.cursor()
 
     cursor.execute('''SELECT o.id, o.total_amount, o.order_date, 
-                      GROUP_CONCAT(CONCAT(f.name, " (", od.quantity, ")") SEPARATOR ", ") as items
+                      STRING_AGG(CONCAT(f.name, ' (', od.quantity, ')'), ', ') as items
                       FROM Orders o
                       JOIN Order_Details od ON o.id = od.order_id
                       JOIN Food_Items f ON od.food_item_id = f.id
@@ -1263,11 +1351,11 @@ def pay_hall_fee(id):
     else:
         # Mark the hall fee as paid
         cursor.execute(
-            "UPDATE Hall_Fees SET status='Paid', paid_at=NOW() WHERE id=%s", (id,))
+            "UPDATE Hall_Fees SET status='Paid', paid_at=CURRENT_TIMESTAMP WHERE id=%s", (id,))
 
         # Create a record in the main Payments table so receipt generation still works uniformly
         cursor.execute(
-            "INSERT INTO Payments (student_id, amount, payment_type, status, payment_date) VALUES (%s, %s, 'Hall Fee', 'Paid', NOW())",
+            "INSERT INTO Payments (student_id, amount, payment_type, status, payment_date) VALUES (%s, %s, 'Hall Fee', 'Paid', CURRENT_TIMESTAMP)",
             (student_id, fee['amount'])
         )
         conn.commit()
@@ -1357,33 +1445,92 @@ def download_receipt(id):
         flash('Payment not found.')
         return redirect(url_for('student_payments'))
 
-    html = render_template('student/receipt_pdf.html',
-                           payment=payment, user_name=session['full_name'])
-
-    # Needs wkhtmltopdf installed on system for pdfkit to work!
-    # For demo purposes we can attempt to generate it or return HTML that looks like a PDF if not installed
     try:
-        wkhtmltopdf_path = os.environ.get('WKHTMLTOPDF_PATH')
-        config = pdfkit.configuration(
-            wkhtmltopdf=wkhtmltopdf_path) if wkhtmltopdf_path else None
+        buffer = BytesIO()
+        document = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            rightMargin=0.75 * inch,
+            leftMargin=0.75 * inch,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+        )
 
-        pdf_options = {
-            'page-size': 'A4',
-            'margin-top': '0.75in',
-            'margin-right': '0.75in',
-            'margin-bottom': '0.75in',
-            'margin-left': '0.75in',
-        }
-        pdf = pdfkit.from_string(
-            html, False, options=pdf_options, configuration=config)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'ReceiptTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=20,
+            leading=24,
+            textColor=colors.HexColor('#1f3b73'),
+            alignment=1,
+        )
+        section_style = ParagraphStyle(
+            'ReceiptSection',
+            parent=styles['Heading2'],
+            fontName='Helvetica-Bold',
+            fontSize=12,
+            leading=15,
+            textColor=colors.HexColor('#1f3b73'),
+        )
+        body_style = ParagraphStyle(
+            'ReceiptBody',
+            parent=styles['BodyText'],
+            fontName='Helvetica',
+            fontSize=10,
+            leading=14,
+            spaceAfter=4,
+        )
 
-        response = make_response(pdf)
+        receipt_rows = [
+            ['Receipt ID', str(payment['id'])],
+            ['Student', session['full_name']],
+            ['Payment Type', payment['payment_type']],
+            ['Status', payment['status']],
+            ['Amount', format_currency(payment['amount'])],
+            ['Payment Date', format_timestamp(payment.get('payment_date'))],
+        ]
+
+        elements = [
+            Paragraph('Py_Hostel Receipt', title_style),
+            Spacer(1, 0.2 * inch),
+            Paragraph('Payment Summary', section_style),
+            Spacer(1, 0.08 * inch),
+        ]
+
+        table = Table(receipt_rows, colWidths=[1.8 * inch, 4.6 * inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.whitesmoke),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('LEADING', (0, 0), (-1, -1), 13),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e1')),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#eef2ff')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 0.2 * inch))
+        elements.append(Paragraph(
+            'This receipt confirms the recorded payment in the Py_Hostel system.',
+            body_style
+        ))
+
+        document.build(elements)
+        pdf_data = buffer.getvalue()
+        buffer.close()
+
+        response = make_response(pdf_data)
         response.headers['Content-Type'] = 'application/pdf'
         response.headers['Content-Disposition'] = f'attachment; filename=receipt_{id}.pdf'
         return response
     except Exception as e:
-        print(f"PDF generation error: {e}")
-        flash('PDF generation failed. Install wkhtmltopdf and set WKHTMLTOPDF_PATH on the server.', 'error')
+        print(f'PDF generation error: {e}')
+        flash('PDF generation failed.', 'error')
         return redirect(url_for('student_payments'))
 
 
@@ -1525,7 +1672,7 @@ def student_reading_room():
         return redirect(url_for('student_reading_room'))
 
     cursor.execute('''SELECT * FROM Reading_Room_Bookings 
-                      WHERE student_id=%s AND booking_date >= CURDATE()
+                      WHERE student_id=%s AND booking_date >= CURRENT_DATE
                       ORDER BY booking_date, time_slot''', (student_id,))
     bookings = cursor.fetchall()
     conn.close()
@@ -1603,10 +1750,13 @@ def handle_message(data):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''INSERT INTO Chat_Messages (sender_id, receiver_id, message) 
-                      VALUES (%s, %s, %s)''', (sender_id, receiver_id, message))
+    msg_id = insert_and_get_id(
+        cursor,
+        '''INSERT INTO Chat_Messages (sender_id, receiver_id, message) 
+           VALUES (%s, %s, %s)''',
+        (sender_id, receiver_id, message)
+    )
     conn.commit()
-    msg_id = cursor.lastrowid
 
     cursor.execute('SELECT * FROM Chat_Messages WHERE id = %s', (msg_id,))
     msg_data = cursor.fetchone()
@@ -1630,4 +1780,9 @@ def on_join(data):
 
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 5000)),
+        debug=(os.environ.get('RENDER') != '1')
+    )

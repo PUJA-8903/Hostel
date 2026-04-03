@@ -1,3 +1,6 @@
 .env
 backups/
 migrations/
+.venv/
+__pycache__/
+*.pyc
