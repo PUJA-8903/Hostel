@@ -222,6 +222,10 @@
         }
     });
 
+    socket.on('chat_error', () => {
+        alert('Message could not be sent. Please try again.');
+    });
+
     document.querySelectorAll('.contact-item').forEach((item) => {
         item.addEventListener('click', () => {
             const id = Number(item.dataset.id);
@@ -266,15 +270,35 @@
         scrollToBottom();
     }
 
-    function sendMessage() {
+    async function sendMessage() {
         const input = document.getElementById('msg-text');
         const text = input.value.trim();
         if (text && activeReceiverId) {
-            socket.emit('send_message', {
-                receiver_id: activeReceiverId,
-                message: text
-            });
-            input.value = '';
+            try {
+                const response = await fetch('/api/chat/send', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: JSON.stringify({
+                        receiver_id: activeReceiverId,
+                        message: text
+                    })
+                });
+
+                const payload = await response.json();
+                if (!response.ok || !payload.ok) {
+                    throw new Error('send_failed');
+                }
+
+                appendMessage(payload.message);
+            } catch (error) {
+                alert('Message could not be sent. Please try again.');
+            } finally {
+                input.value = '';
+                input.focus();
+            }
         }
     }
 

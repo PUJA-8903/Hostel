@@ -765,7 +765,7 @@ def admin_orders():
                       JOIN Users u ON o.student_id = u.id
                       JOIN Order_Details od ON o.id = od.order_id
                       JOIN Food_Items f ON od.food_item_id = f.id
-                      GROUP BY o.id
+                      GROUP BY o.id, u.full_name, o.total_amount, o.order_date
                       ORDER BY o.order_date DESC''')
     orders = cursor.fetchall()
     conn.close()
@@ -1744,31 +1744,74 @@ def get_chat_history(receiver_id):
     return jsonify(messages)
 
 
+def save_chat_message(sender_id, receiver_id, message):
+    clean_message = (message or '').strip()
+    if not sender_id or not receiver_id or not clean_message:
+        return None
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        msg_id = insert_and_get_id(
+            cursor,
+            '''INSERT INTO Chat_Messages (sender_id, receiver_id, message)
+               VALUES (%s, %s, %s)''',
+            (sender_id, receiver_id, clean_message)
+        )
+        conn.commit()
+
+        cursor.execute('SELECT * FROM Chat_Messages WHERE id = %s', (msg_id,))
+        msg_data = cursor.fetchone()
+        if msg_data and msg_data.get('sent_at'):
+            msg_data['sent_at'] = msg_data['sent_at'].strftime(
+                '%Y-%m-%d %H:%M')
+        return msg_data
+    except Exception:
+        conn.rollback()
+        return None
+    finally:
+        cursor.close()
+
+
+@app.route('/api/chat/send', methods=['POST'])
+def send_chat_message():
+    if 'user_id' not in session:
+        return jsonify({'ok': False, 'error': 'Unauthorized'}), 401
+
+    payload = request.get_json(silent=True) or request.form
+    receiver_id_raw = payload.get('receiver_id')
+    message = payload.get('message', '')
+
+    try:
+        receiver_id = int(receiver_id_raw)
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'Invalid receiver'}), 400
+
+    msg_data = save_chat_message(session['user_id'], receiver_id, message)
+    if not msg_data:
+        return jsonify({'ok': False, 'error': 'Unable to send message'}), 400
+
+    socketio.emit('receive_message', msg_data, room=f'user_{receiver_id}')
+    return jsonify({'ok': True, 'message': msg_data})
+
+
 @socketio.on('send_message')
 def handle_message(data):
     sender_id = session.get('user_id')
     if not sender_id:
         return
 
-    receiver_id = data['receiver_id']
-    message = data['message']
+    try:
+        receiver_id = int(data.get('receiver_id'))
+    except (TypeError, ValueError):
+        emit('chat_error', {'error': 'Invalid receiver'})
+        return
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    msg_id = insert_and_get_id(
-        cursor,
-        '''INSERT INTO Chat_Messages (sender_id, receiver_id, message) 
-           VALUES (%s, %s, %s)''',
-        (sender_id, receiver_id, message)
-    )
-    conn.commit()
-
-    cursor.execute('SELECT * FROM Chat_Messages WHERE id = %s', (msg_id,))
-    msg_data = cursor.fetchone()
-    msg_data['sent_at'] = msg_data['sent_at'].strftime('%Y-%m-%d %H:%M')
-
-    cursor.close()
-    conn.close()
+    msg_data = save_chat_message(
+        sender_id, receiver_id, data.get('message', ''))
+    if not msg_data:
+        emit('chat_error', {'error': 'Unable to send message'})
+        return
 
     # Send to the receiver's room and the sender's room
     emit('receive_message', msg_data, room=f"user_{receiver_id}")
