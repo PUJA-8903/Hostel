@@ -154,8 +154,10 @@ VALUES
 ('teacher1@nasa.com', 'scrypt:32768:8:1$CzCnffkabev1YaOm$6c54b147262e1e533c0440b6ff7221bb375847c19138d6b180102e6105e03db9b6b9045e2f659651df8ddd7aec2711da37cf8c08724d94f2e543c9b3071b5008', 'Teacher', 'Mr. Smith')
 ON CONFLICT (email) DO NOTHING;
 
+INSERT INTO Food_Items (name, category, price)
+VALUES ('chicken curry', 'Non-Veg', 50.00)
+ON CONFLICT (name) DO NOTHING;
 
-ON CONFLICT DO NOTHING;
 
 INSERT INTO Rooms (room_number, capacity, teacher_id)
 VALUES
