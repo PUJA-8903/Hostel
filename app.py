@@ -134,8 +134,9 @@ def bootstrap_database(conn):
             cursor.execute(schema_file.read())
         conn.commit()
         SCHEMA_BOOTSTRAP_DONE = True
-    except Exception:
+    except Exception as exc:
         conn.rollback()
+        app.logger.exception('Database bootstrap failed: %s', exc)
         raise
     finally:
         cursor.close()

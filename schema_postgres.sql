@@ -155,8 +155,12 @@ VALUES
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO Food_Items (name, category, price)
-VALUES ('chicken curry', 'Non-Veg', 50.00)
-ON CONFLICT (name) DO NOTHING;
+SELECT 'chicken curry', 'Non-Veg', 50.00
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM Food_Items
+    WHERE name = 'chicken curry'
+);
 
 
 INSERT INTO Rooms (room_number, capacity, teacher_id)
